@@ -29,7 +29,7 @@ class WikidataBot:
         self.edited_pages = []
         self.error_pages = []
 
-        self.templates = [
+        self.templates = [ ## Customer from https://www.hamichlol.org.il/משתמש:מקוה/ויקינתונים.js
             {
                 "name": "ויקישיתוף בשורה",
                 "regex": r"\{\{ויקישיתוף\sבשורה\s?\|?\s?\}\}",
