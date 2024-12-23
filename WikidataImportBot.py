@@ -1,15 +1,9 @@
-import requests
-import json
-import os
-from datetime import datetime
-from time import sleep
-import re
+import aiohttp
+import asyncio
 import logging
-import urllib3
-from urllib3.util.retry import Retry
-from requests.adapters import HTTPAdapter
-
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+import re
+from datetime import datetime, timezone
+from time import sleep
 
 logging.basicConfig(
     level=logging.INFO,
@@ -22,33 +16,20 @@ logging.basicConfig(
 
 API_URL = "https://www.hamichlol.org.il/w/api.php"
 USERNAME = "נריה_בוט@test1"
-PASSWORD = " " ## סיסמת הבוט
+PASSWORD = " " ## bot's password
 
 class WikidataBot:
     def __init__(self):
-        self.session = requests.Session()
-        
-        retry_strategy = Retry(
-            total=3, 
-            backoff_factor=1,
-            status_forcelist=[500, 502, 503, 504],
-        )
-        
-        adapter = HTTPAdapter(max_retries=retry_strategy)
-        self.session.mount("http://", adapter)
-        self.session.mount("https://", adapter)
-        
-        self.session.verify = False
-        
-        self.login()
-        
+        self.session = None
+        self.edit_token = None
+        self.num_requests = 0
         self.log_path = "log.txt"
         self.wiki_log_page = "משתמש:נריה_בוט/log-wikidata"
         self.processed_count = 0
         self.edited_pages = []
         self.error_pages = []
-        
-        self.templates = [ ## Customer from https://www.hamichlol.org.il/משתמש:מקוה/ויקינתונים.js
+
+        self.templates = [
             {
                 "name": "ויקישיתוף בשורה",
                 "regex": r"\{\{ויקישיתוף\sבשורה\s?\|?\s?\}\}",
@@ -262,52 +243,76 @@ class WikidataBot:
                 "parameters": [{"claim": "P8590", "param": "", "text": ""}]
             },
         ]
-        
-    def login(self):
-        try:
-            r1 = self.session.get(API_URL, params={
-                'action': 'query',
-                'meta': 'tokens',
-                'type': 'login',
-                'format': 'json'
-            })
-            r1.raise_for_status()
-            
-            if 'query' not in r1.json() or 'tokens' not in r1.json()['query']:
-                raise Exception('Invalid login response structure')
-            
-            r2 = self.session.post(API_URL, data={
-                'action': 'login',
-                'lgname': USERNAME,
-                'lgpassword': PASSWORD,
-                'lgtoken': r1.json()['query']['tokens']['logintoken'],
-                'format': 'json'
-            })
-            r2.raise_for_status()
-            
-            if r2.json()['login']['result'] != 'Success':
-                raise Exception('Login failed')
-            
-            r3 = self.session.get(API_URL, params={
-                'action': 'query',
-                'meta': 'tokens',
-                'format': 'json'
-            })
-            r3.raise_for_status()
-            
-            if 'query' not in r3.json() or 'tokens' not in r3.json()['query']:
-                raise Exception('Failed to get edit token')
-                
-            self.edit_token = r3.json()['query']['tokens']['csrftoken']
-            logging.info("Successfully logged in and got edit token")
-            
-        except requests.exceptions.RequestException as e:
-            raise Exception(f'Network error during login: {str(e)}')
-        except Exception as e:
-            raise Exception(f'Login error: {str(e)}')
 
-    def get_all_pages(self):
-        continue_param = {} ## משיכת כל הערכים במרחב הראשי
+    async def open_session(self):
+        if self.session is None:
+            self.session = aiohttp.ClientSession()
+
+    async def close_session(self):
+        if self.session:
+            await self.session.close()
+            self.session = None
+
+    async def __aenter__(self):
+        await self.open_session()
+        return self
+
+    async def __aexit__(self, exc_type, exc_value, traceback):
+        await self.close_session()
+
+    async def wiki_request(self, method: str, data: dict, token=None):
+        self.num_requests += 1
+        await self.open_session()
+        data['format'] = 'json'
+        if token is not None:
+            data['token'] = token
+
+        try:
+            async with self.session.request(method, API_URL, 
+                                          params=data if method == 'get' else None, 
+                                          data=data if method == 'post' else None) as response:
+                response.raise_for_status()
+                return await response.json()
+        except Exception as e:
+            logging.error(f"Error in wiki_request: {str(e)}")
+            return None
+
+    async def get_token(self, token_type="csrf"):
+        params = {
+            "action": "query",
+            "meta": "tokens",
+            "type": token_type
+        }
+        response = await self.wiki_request('get', params)
+        try:
+            return response['query']['tokens'][f'{token_type}token']
+        except Exception as e:
+            logging.error(f'Error getting {token_type} token: {str(e)}')
+            return None
+
+    async def login(self):
+        login_token = await self.get_token('login')
+        if not login_token:
+            logging.error("Failed to get login token")
+            return False
+
+        data = {
+            "action": "login",
+            "lgname": USERNAME,
+            "lgpassword": PASSWORD,
+            "lgtoken": login_token
+        }
+        
+        response = await self.wiki_request('post', data)
+        if response and response.get('login', {}).get('result') == 'Success':
+            self.edit_token = await self.get_token()
+            logging.info("Successfully logged in and got edit token")
+            return True
+        logging.error("Login failed")
+        return False
+
+    async def get_all_pages(self):
+        continue_param = {}
         while True:
             try:
                 params = {
@@ -319,30 +324,92 @@ class WikidataBot:
                 }
                 params.update(continue_param)
                 
-                response = self.session.get(API_URL, params=params)
-                response.raise_for_status()
-                data = response.json()
-                
-                if 'query' not in data or 'allpages' not in data['query']:
-                    logging.warning("Unexpected API response structure")
+                response = await self.wiki_request('get', params)
+                if not response or 'query' not in response:
                     break
                     
-                for page in data['query']['allpages']:
+                for page in response['query']['allpages']:
                     yield page
                 
-                if 'continue' not in data:
+                if 'continue' not in response:
                     break
-                continue_param = data['continue']
+                continue_param = response['continue']
                 
-                sleep(1)
+                await asyncio.sleep(1)
                 
-            except requests.exceptions.RequestException as e:
-                logging.error(f"Network error while fetching pages: {str(e)}")
-                sleep(5) 
-                continue
             except Exception as e:
                 logging.error(f"Error fetching pages: {str(e)}")
                 break
+
+    async def get_wikidata_claims(self, title):
+        params = {
+            'action': 'wbgetentities',
+            'sites': 'hewiki',
+            'titles': title,
+            'props': 'claims|labels|descriptions',
+            'languages': 'he',
+            'format': 'json'
+        }
+        
+        for attempt in range(3):
+            try:
+                async with self.session.get('https://www.wikidata.org/w/api.php', 
+                                          params=params, ssl=False) as response:
+                    if response.status == 200:
+                        return await response.json()
+                    
+            except Exception as e:
+                logging.error(f"Wikidata attempt {attempt + 1} failed: {str(e)}")
+                if attempt < 2:
+                    await asyncio.sleep(2 ** attempt)
+                continue
+                
+        logging.error(f"Failed to fetch Wikidata claims for {title} after 3 attempts")
+        return {}
+
+    async def get_page_content(self, title):
+        params = {
+            'action': 'query',
+            'prop': 'revisions',
+            'titles': title,
+            'rvprop': 'content',
+            'format': 'json'
+        }
+        
+        try:
+            response = await self.wiki_request('get', params)
+            if not response or 'query' not in response:
+                return ""
+                
+            page = next(iter(response['query']['pages'].values()))
+            if 'revisions' not in page:
+                return ""
+                
+            return page['revisions'][0]['*']
+            
+        except Exception as e:
+            logging.error(f"Error getting page content: {str(e)}")
+            return ""
+
+    async def save_page(self, title, text, summary):
+        if not self.edit_token:
+            self.edit_token = await self.get_token()
+
+        data = {
+            'action': 'edit',
+            'title': title,
+            'text': text,
+            'summary': summary,
+            'token': self.edit_token,
+            'bot': '1'
+        }
+        
+        try:
+            response = await self.wiki_request('post', data)
+            return response and 'error' not in response
+        except Exception as e:
+            logging.error(f"Error saving page {title}: {str(e)}")
+            return False
 
     def process_another_meaning(self, text, wikidata_data):
         try:
@@ -409,18 +476,17 @@ class WikidataBot:
         
         return text
 
-    def process_page(self, title, content):
+    async def process_page(self, title, content):
         try:
             title_for_wikidata = title.replace('הרב ', '').replace('רבי ', '')
             
-            wikidata_data = self.get_wikidata_claims(title_for_wikidata)
+            wikidata_data = await self.get_wikidata_claims(title_for_wikidata)
             if not wikidata_data or 'entities' not in wikidata_data:
                 return content
                 
             entity_data = next(iter(wikidata_data['entities'].values()))
             
             new_text = content
-            
             new_text = self.process_another_meaning(new_text, entity_data)
             
             for template in self.templates:
@@ -432,96 +498,6 @@ class WikidataBot:
         except Exception as e:
             logging.error(f"Error processing page {title}: {str(e)}")
             return content
-
-    def get_wikidata_claims(self, title):
-        params = {
-            'action': 'wbgetentities',
-            'sites': 'hewiki',
-            'titles': title,
-            'props': 'claims|labels|descriptions',
-            'languages': 'he',
-            'format': 'json'
-        }
-        
-        for attempt in range(3):
-            try:
-                response = requests.get('https://www.wikidata.org/w/api.php', 
-                                     params=params, 
-                                     verify=False)
-                response.raise_for_status()
-                
-                if response.status_code == 200:
-                    return response.json()
-                    
-            except requests.exceptions.RequestException as e:
-                logging.error(f"Attempt {attempt + 1} failed: {str(e)}")
-                if attempt < 2:
-                    sleep(2 ** attempt) 
-                continue
-                
-            except Exception as e:
-                logging.error(f"Error processing Wikidata response: {str(e)}")
-                break
-                
-        logging.error(f"Failed to fetch Wikidata claims for {title} after 3 attempts")
-        return {}
-
-    def get_page_content(self, title):
-        params = {
-            'action': 'query',
-            'prop': 'revisions',
-            'titles': title,
-            'rvprop': 'content',
-            'format': 'json'
-        }
-        
-        try:
-            response = self.session.get(API_URL, params=params)
-            response.raise_for_status()
-            
-            data = response.json()
-            if 'query' not in data or 'pages' not in data['query']:
-                logging.error(f"Error: Unexpected API response structure for {title}")
-                return ""
-                
-            page = next(iter(data['query']['pages'].values()))
-            if 'revisions' not in page:
-                logging.error(f"Error: No revisions found for {title}")
-                return ""
-                
-            return page['revisions'][0]['*']
-            
-        except requests.exceptions.RequestException as e:
-            logging.error(f"Network error getting page content: {str(e)}")
-            return ""
-        except Exception as e:
-            logging.error(f"Error getting page content: {str(e)}")
-            return ""
-
-    def save_page(self, title, text, summary):
-        try:
-            data = {
-                'action': 'edit',
-                'title': title,
-                'text': text,
-                'summary': summary,
-                'token': self.edit_token,
-                'bot': '1',
-                'format': 'json'
-            }
-            
-            response = self.session.post(API_URL, data=data)
-            response.raise_for_status()
-            
-            result = response.json()
-            return 'error' not in result
-            
-        except requests.exceptions.RequestException as e:
-            logging.error(f"Network error saving page {title}: {str(e)}")
-            return False
-        except Exception as e:
-            logging.error(f"Error saving page {title}: {str(e)}")
-            return False
 
     def log_progress(self, message, is_error=False):
         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -540,33 +516,38 @@ class WikidataBot:
                 f.write(log_entry)
         except Exception as e:
             logging.error(f"Error writing to local log: {str(e)}")
-        
-        if self.processed_count > 0 and self.processed_count % 200 == 0:
-            try:
-                log_content = "== עריכות אחרונות ==\n"
-                log_content += "\n".join(self.edited_pages[-200:])
-                log_content += "\n\n== שגיאות אחרונות ==\n"
-                log_content += "\n".join(self.error_pages[-200:])
-                
-                self.save_page(
-                    self.wiki_log_page, 
-                    log_content,
-                    f"עדכון לוג אוטומטי - {len(self.edited_pages)} עריכות, {len(self.error_pages)} שגיאות"
-                )
-                logging.info(f"Updated wiki log at {self.processed_count} pages")
-            except Exception as e:
-                logging.error(f"Error updating wiki log: {str(e)}")
 
-    def run(self):
+    async def update_wiki_log(self):
+        try:
+            log_content = "== עריכות אחרונות ==\n"
+            log_content += "\n".join(self.edited_pages[-200:])
+            log_content += "\n\n== שגיאות אחרונות ==\n"
+            log_content += "\n".join(self.error_pages[-200:])
+            
+            success = await self.save_page(
+                self.wiki_log_page, 
+                log_content,
+                f"עדכון לוג אוטומטי - {len(self.edited_pages)} עריכות, {len(self.error_pages)} שגיאות"
+            )
+            if success:
+                logging.info(f"Updated wiki log at {self.processed_count} pages")
+        except Exception as e:
+            logging.error(f"Error updating wiki log: {str(e)}")
+
+    async def run(self):
         logging.info("התחלת ריצת הבוט")
         self.log_progress("התחלת ריצת הבוט")
         
         try:
-            for page in self.get_all_pages():
+            if not await self.login():
+                logging.error("Failed to login, stopping bot")
+                return
+
+            async for page in self.get_all_pages():
                 try:
                     title = page['title']
                     logging.info(f"מעבד את הדף: {title}")
-                    content = self.get_page_content(title)
+                    content = await self.get_page_content(title)
                     
                     if not content:
                         continue
@@ -575,14 +556,17 @@ class WikidataBot:
                              for template in self.templates):
                         continue
                     
-                    new_text = self.process_page(title, content)
+                    new_text = await self.process_page(title, content)
                     
                     if new_text != content:
-                        if self.save_page(title, new_text, 'שאיבת פרמטרי תבנית מוויקינתונים'):
+                        if await self.save_page(title, new_text, 'שאיבת פרמטרי תבנית מוויקינתונים'):
                             self.log_progress(f"נערך הדף: {title}")
-                            sleep(1)
+                            await asyncio.sleep(1)
                     
                     self.processed_count += 1
+                    
+                    if self.processed_count % 200 == 0:
+                        await self.update_wiki_log()
                     
                 except Exception as e:
                     error_msg = f"שגיאה בדף {title}: {str(e)}"
@@ -593,7 +577,9 @@ class WikidataBot:
             error_msg = f"שגיאה כללית: {str(e)}"
             self.log_progress(error_msg, is_error=True)
             raise
+        finally:
+            await self.close_session()
 
 if __name__ == "__main__":
     bot = WikidataBot()
-    bot.run()
+    asyncio.run(bot.run())
