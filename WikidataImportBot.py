@@ -366,6 +366,58 @@ class WikidataBot:
                 
         logging.error(f"Failed to fetch Wikidata claims for {title} after 3 attempts")
         return {}
+    async def get_wikidata_claims_batch(self, titles):
+        params = {
+            'action': 'wbgetentities',
+            'sites': 'hewiki',
+            'titles': '|'.join(titles),
+            'props': 'claims|labels|descriptions',
+            'languages': 'he',
+            'format': 'json'
+        }
+        
+        for attempt in range(3):
+            try:
+                async with self.session.get('https://www.wikidata.org/w/api.php', 
+                                          params=params, ssl=False) as response:
+                    if response.status == 200:
+                        return await response.json()
+                    
+            except Exception as e:
+                logging.error(f"Wikidata batch attempt {attempt + 1} failed: {str(e)}")
+                if attempt < 2:
+                    await asyncio.sleep(2 ** attempt)
+                continue
+                
+        logging.error(f"Failed to fetch Wikidata claims for batch after 3 attempts")
+        return {}
+    
+    async def process_batch(self, titles, contents):
+        wikidata_data = await self.get_wikidata_claims_batch(titles)
+        
+        for title in titles:
+            content = contents[title]
+            entity_data = wikidata_data.get('entities', {}).get(next((k for k in wikidata_data.get('entities', {}) if wikidata_data['entities'][k]['title'] == title), None))
+            
+            if not entity_data:
+                continue
+    
+            new_text = content
+            new_text = self.process_another_meaning(new_text, entity_data)
+            
+            for template in self.templates:
+                if re.search(template['regex'], new_text, re.IGNORECASE):
+                    new_text = self.process_template(new_text, entity_data, template)
+            
+            if new_text != content:
+                if await self.save_page(title, new_text, 'שאיבת פרמטרי תבנית מוויקינתונים'):
+                    self.log_progress(f"נערך הדף: {title}")
+                    await asyncio.sleep(1)
+            
+            self.processed_count += 1
+            
+            if self.processed_count % 200 == 0:
+                await self.update_wiki_log()
 
     async def get_page_content(self, title):
         params = {
