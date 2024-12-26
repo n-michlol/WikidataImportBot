@@ -319,7 +319,7 @@ class WikidataBot:
                     'action': 'query',
                     'list': 'allpages',
                     'apnamespace': '0',
-                    'aplimit': '500',
+                    'aplimit': 'max',
                     'format': 'json'
                 }
                 params.update(continue_param)
