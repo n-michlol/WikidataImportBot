@@ -1,6 +1,7 @@
 import aiohttp
 import asyncio
 import logging
+import os
 import re
 from datetime import datetime, timezone
 from time import sleep
@@ -15,8 +16,9 @@ logging.basicConfig(
 )
 
 API_URL = "https://www.hamichlol.org.il/w/api.php"
-USERNAME = "נריה_בוט@test1"
-PASSWORD = " " ## bot's password
+USERNAME = os.getenv('BOT_USERNAME')
+PASSWORD = os.getenv('BOT_PASSWORD')
+CATEGORY = "שגיאות פרמטריות בתבנית ויקישיתוף בשורה" 
 
 class WikidataBot:
     def __init__(self):
@@ -28,7 +30,7 @@ class WikidataBot:
         self.processed_count = 0
         self.edited_pages = []
         self.error_pages = []
-
+        
         self.templates = [ ## Customer from https://www.hamichlol.org.il/משתמש:מקוה/ויקינתונים.js
             {
                 "name": "ויקישיתוף בשורה",
@@ -311,15 +313,16 @@ class WikidataBot:
         logging.error("Login failed")
         return False
 
-    async def get_all_pages(self):
+    async def get_category_members(self):
         continue_param = {}
         while True:
             try:
                 params = {
                     'action': 'query',
-                    'list': 'allpages',
-                    'apnamespace': '0',
-                    'aplimit': 'max',
+                    'list': 'categorymembers',
+                    'cmtitle': f'קטגוריה:{CATEGORY}',
+                    'cmlimit': '500',
+                    'cmnamespace': '0',
                     'format': 'json'
                 }
                 params.update(continue_param)
@@ -328,7 +331,7 @@ class WikidataBot:
                 if not response or 'query' not in response:
                     break
                     
-                for page in response['query']['allpages']:
+                for page in response['query']['categorymembers']:
                     yield page
                 
                 if 'continue' not in response:
@@ -338,7 +341,7 @@ class WikidataBot:
                 await asyncio.sleep(1)
                 
             except Exception as e:
-                logging.error(f"Error fetching pages: {str(e)}")
+                logging.error(f"Error fetching category members: {str(e)}")
                 break
 
     async def get_wikidata_claims(self, title):
@@ -411,41 +414,22 @@ class WikidataBot:
             logging.error(f"Error saving page {title}: {str(e)}")
             return False
 
-    def process_another_meaning(self, text, wikidata_data):
-        try:
-            if not re.search(r"\{\{פירוש\sנוסף\s?\|?\s?\}\}", text):
-                return text
-                
-            if 'descriptions' not in wikidata_data or 'he' not in wikidata_data.get('descriptions', {}):
-                return text
-                
-            description = wikidata_data['descriptions']['he'].get('value', '')
-            if description:
-                return re.sub(
-                    r"\{\{פירוש\sנוסף\s?\|?\s?\}\}",
-                    f"{{פירוש נוסף|נוכחי={description}}}",
-                    text
-                )
-            return text
-        except Exception as e:
-            logging.error(f"Error processing another meaning: {str(e)}")
-            return text
-
     def get_claim_value(self, claim, parameter):
         try:
-            if parameter['claim'] == 'P1559':
-                if parameter['param'] == 'שפה':
-                    return claim['mainsnak']['datavalue']['value']['language']
-                return claim['mainsnak']['datavalue']['value']['text'].replace('=', '{{=}}')
-            
             if 'datavalue' not in claim['mainsnak']:
                 return None
                 
             value = claim['mainsnak']['datavalue'].get('value', '')
             if isinstance(value, str):
+                # Add Category: prefix if it's missing and parameter requests it
+                if parameter.get('text') == 'Category:' and not value.startswith('Category:'):
+                    value = 'Category:' + value
                 return value.replace('=', '{{=}}')
             elif isinstance(value, dict) and 'text' in value:
-                return value['text'].replace('=', '{{=}}')
+                text_value = value['text']
+                if parameter.get('text') == 'Category:' and not text_value.startswith('Category:'):
+                    text_value = 'Category:' + text_value
+                return text_value.replace('=', '{{=}}')
             return str(value)
         except Exception as e:
             logging.error(f"Error extracting claim value: {str(e)}")
@@ -466,7 +450,6 @@ class WikidataBot:
                 claim_value = self.get_claim_value(claims[param['claim']][0], param)
                 if claim_value:
                     param_text = (f"|{param['param']}={claim_value}" if param['param'] 
-                                else f"|{param['text']}{claim_value}" if param['text']
                                 else f"|{claim_value}")
                     parameters.append(param_text)
         
@@ -487,8 +470,6 @@ class WikidataBot:
             entity_data = next(iter(wikidata_data['entities'].values()))
             
             new_text = content
-            new_text = self.process_another_meaning(new_text, entity_data)
-            
             for template in self.templates:
                 if re.search(template['regex'], new_text, re.IGNORECASE):
                     new_text = self.process_template(new_text, entity_data, template)
@@ -543,17 +524,13 @@ class WikidataBot:
                 logging.error("Failed to login, stopping bot")
                 return
 
-            async for page in self.get_all_pages():
+            async for page in self.get_category_members():
                 try:
                     title = page['title']
                     logging.info(f"מעבד את הדף: {title}")
                     content = await self.get_page_content(title)
                     
                     if not content:
-                        continue
-                    
-                    if not any(re.search(template['regex'], content, re.IGNORECASE) 
-                             for template in self.templates):
                         continue
                     
                     new_text = await self.process_page(title, content)
