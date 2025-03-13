@@ -18,7 +18,7 @@ logging.basicConfig(
 API_URL = "https://www.hamichlol.org.il/w/api.php"
 USERNAME = os.getenv('BOT_USERNAME')
 PASSWORD = os.getenv('BOT_PASSWORD')
-CATEGORY = "שגיאות פרמטריות בתבנית ויקישיתוף בשורה" 
+CATEGORY = "שגיאות פרמטריות בתבנית אתר רשמי" 
 
 class WikidataBot:
     def __init__(self):
